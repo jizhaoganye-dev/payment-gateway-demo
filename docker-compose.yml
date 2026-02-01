@@ -1,0 +1,83 @@
+# =============================================================================
+# Payment Gateway Demo - Docker Compose
+# =============================================================================
+# 開発・デモ環境用のコンテナオーケストレーション
+# - Backend: Spring Boot (Java 17)
+# - Frontend: React (Nginx)
+# - Database: PostgreSQL
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # -------------------------------------------------------------------------
+  # PostgreSQL データベース
+  # -------------------------------------------------------------------------
+  database:
+    image: postgres:15-alpine
+    container_name: payment-db
+    environment:
+      POSTGRES_DB: paymentdb
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: payment_secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_user -d paymentdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - payment-network
+
+  # -------------------------------------------------------------------------
+  # Backend API (Spring Boot)
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.backend
+    container_name: payment-backend
+    environment:
+      SPRING_PROFILES_ACTIVE: production
+      DB_HOST: database
+      DB_PORT: 5432
+      DB_NAME: paymentdb
+      DB_USERNAME: payment_user
+      DB_PASSWORD: payment_secret
+    ports:
+      - "8080:8080"
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/api/v1/payments/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - payment-network
+
+  # -------------------------------------------------------------------------
+  # Frontend (React + Nginx)
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.frontend
+    container_name: payment-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - payment-network
+
+networks:
+  payment-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

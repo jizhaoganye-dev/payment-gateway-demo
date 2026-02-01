@@ -1,0 +1,58 @@
+# =============================================================================
+# Payment Gateway Demo - Git Ignore
+# =============================================================================
+
+# Java / Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.log
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# Node.js
+node_modules/
+dist/
+.cache/
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+build/
+out/
+.next/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Test & Coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Vercel
+.vercel/
+
+# Temporary files
+*.tmp
+*.temp
