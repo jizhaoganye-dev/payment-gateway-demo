@@ -1,43 +1,62 @@
-# =============================================================================
-# Payment Dashboard Frontend - Dockerfile
-# =============================================================================
-# マルチステージビルドによる最適化
-# - ビルドステージ: Node.js + npm
-# - 実行ステージ: Nginx（静的ファイル配信）
-# =============================================================================
+# ============================================================================
+# 金融決済システム フロントエンド Dockerfile
+# マルチステージビルドによる本番最適化
+# ============================================================================
 
-# ビルドステージ
+# ============================================================================
+# Stage 1: ビルドステージ
+# ============================================================================
 FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# 依存関係のキャッシュを効率化
-COPY frontend/package*.json ./
-RUN npm ci
+# package.json を先にコピーして依存関係をキャッシュ
+COPY frontend/package.json frontend/package-lock.json* ./
 
-# ソースコードをコピーしてビルド
+# 依存関係のインストール
+RUN npm ci --only=production=false
+
+# ソースコードをコピー
 COPY frontend/ .
+
+# 環境変数設定（ビルド時）
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=$VITE_API_URL
+
+# ビルド実行
 RUN npm run build
 
-# =============================================================================
-# 実行ステージ
-# =============================================================================
-FROM nginx:alpine
+# ============================================================================
+# Stage 2: ランタイムステージ
+# ============================================================================
+FROM nginx:1.25-alpine AS runtime
 
-LABEL maintainer="AI Native Engineer"
-LABEL description="Payment Dashboard Frontend"
-LABEL version="1.0.0"
+# セキュリティ: 不要なパッケージを削除
+RUN apk del --purge apk-tools && \
+    rm -rf /var/cache/apk/*
 
-# Nginx設定
+# Nginx設定をコピー
 COPY infrastructure/docker/nginx.conf /etc/nginx/nginx.conf
 
 # ビルド成果物をコピー
 COPY --from=builder /app/dist /usr/share/nginx/html
 
+# Nginxをrootで実行しない設定
+RUN chown -R nginx:nginx /usr/share/nginx/html && \
+    chown -R nginx:nginx /var/cache/nginx && \
+    chown -R nginx:nginx /var/log/nginx && \
+    touch /var/run/nginx.pid && \
+    chown -R nginx:nginx /var/run/nginx.pid
+
+# 非rootユーザーに切り替え
+USER nginx
+
+# ポート公開
+EXPOSE 80
+
 # ヘルスチェック
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:80/ || exit 1
 
-EXPOSE 80
-
+# Nginx起動
 CMD ["nginx", "-g", "daemon off;"]

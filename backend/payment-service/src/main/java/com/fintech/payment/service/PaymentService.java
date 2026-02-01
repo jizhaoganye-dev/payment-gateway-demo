@@ -4,74 +4,113 @@ import com.fintech.payment.dto.PaymentRequest;
 import com.fintech.payment.dto.PaymentResponse;
 import com.fintech.payment.entity.Transaction;
 import com.fintech.payment.entity.TransactionStatus;
+import com.fintech.payment.exception.InsufficientFundsException;
+import com.fintech.payment.exception.InvalidCardException;
 import com.fintech.payment.exception.PaymentException;
+import com.fintech.payment.exception.PaymentTimeoutException;
 import com.fintech.payment.exception.TransactionNotFoundException;
+import com.fintech.payment.mapper.TransactionMapper;
 import com.fintech.payment.repository.TransactionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
 import java.util.stream.Collectors;
 
 /**
  * 決済サービス
  * 
- * 【設計思想】
- * - トランザクション境界の明確化
- * - 金融グレードのエラーハンドリング
- * - 監査ログの自動記録
+ * 【アーキテクチャ設計】
+ * - Controller → Service → Repository の3層アーキテクチャ
+ * - EntityはService層内で完結、外部へはDTOのみを公開
+ * - MapStructによる型安全なEntity⇔DTO変換
  * 
- * 【リファクタリング履歴】
- * BEFORE (モノリス時代):
- *   - 決済ロジック、通知、ログが混在
- *   - 巨大なメソッド（500行超）
- *   - テスト困難
+ * 【トランザクション設計】
+ * - ACID特性の完全保証
+ * - 分離レベル: READ_COMMITTED（金融標準）
+ * - 冪等性キーによる二重処理防止
  * 
- * AFTER (マイクロサービス化):
- *   - 単一責任: 決済処理のみに集中
- *   - 小さなメソッド（各30行以内）
- *   - 高いテストカバレッジ
+ * 【エラーハンドリング】
+ * - 業務例外と技術例外の明確な分離
+ * - 全エラーにエラーコードを付与
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-@Transactional
 public class PaymentService {
 
     private final TransactionRepository transactionRepository;
+    private final TransactionMapper transactionMapper;
+    private final IdempotencyService idempotencyService;
+    
+    private final Random random = new Random();
 
     /**
      * 決済処理実行
      * 
+     * 【処理フロー】
+     * 1. 冪等性チェック（キャッシュがあれば即座に返却）
+     * 2. トランザクション作成（PENDING状態）
+     * 3. 決済プロセッサー呼び出し（外部API）
+     * 4. 結果に応じてステータス更新
+     * 5. 冪等性キーにレスポンスをキャッシュ
+     * 
      * @param request 決済リクエスト
+     * @param idempotencyKey 冪等性キー（オプション）
      * @return 決済レスポンス
-     * @throws PaymentException 決済処理エラー
      */
-    public PaymentResponse processPayment(PaymentRequest request) {
-        log.info("決済処理開始: merchantId={}, amount={}, currency={}", 
-                request.getMerchantId(), request.getAmount(), request.getCurrency());
+    @Transactional(isolation = Isolation.READ_COMMITTED, rollbackFor = Exception.class)
+    public PaymentResponse processPayment(PaymentRequest request, String idempotencyKey) {
+        log.info("決済処理開始: merchantId={}, amount={}, currency={}, idempotencyKey={}", 
+                request.getMerchantId(), request.getAmount(), request.getCurrency(), 
+                idempotencyKey != null ? idempotencyKey.substring(0, 8) + "..." : "null");
 
-        // トランザクション作成
-        Transaction transaction = createTransaction(request);
-        
-        try {
-            // 決済処理（実際はここで外部決済プロセッサーを呼び出す）
-            transaction = executePayment(transaction);
-            log.info("決済処理成功: transactionId={}", transaction.getTransactionId());
-        } catch (Exception e) {
-            log.error("決済処理失敗: transactionId={}, error={}", 
-                    transaction.getTransactionId(), e.getMessage());
-            transaction = markAsFailed(transaction, "PAYMENT_ERROR", e.getMessage());
+        // 冪等性チェック
+        Optional<PaymentResponse> cachedResponse = idempotencyService.checkAndLock(idempotencyKey, request);
+        if (cachedResponse.isPresent()) {
+            log.info("冪等性キーからキャッシュ返却");
+            return cachedResponse.get();
         }
 
-        return toResponse(transaction);
+        Transaction transaction = null;
+        try {
+            // Entity作成（MapStructを使用）
+            transaction = createTransaction(request);
+            
+            // 決済処理実行
+            transaction = executePayment(transaction);
+            
+            // レスポンス生成（MapStructを使用）
+            PaymentResponse response = transactionMapper.toResponse(transaction);
+            
+            // 冪等性キーにキャッシュ
+            idempotencyService.markCompleted(idempotencyKey, response);
+            
+            log.info("決済処理成功: transactionId={}", transaction.getTransactionId());
+            return response;
+            
+        } catch (Exception e) {
+            log.error("決済処理失敗: error={}", e.getMessage());
+            
+            // トランザクションがある場合は失敗ステータスに更新
+            if (transaction != null && transaction.getId() != null) {
+                markTransactionFailed(transaction, e);
+            }
+            
+            // 冪等性キーを失敗状態に
+            idempotencyService.markFailed(idempotencyKey);
+            
+            throw e;
+        }
     }
 
     /**
@@ -81,7 +120,7 @@ public class PaymentService {
     public PaymentResponse getTransaction(String transactionId) {
         Transaction transaction = transactionRepository.findByTransactionId(transactionId)
                 .orElseThrow(() -> new TransactionNotFoundException(transactionId));
-        return toResponse(transaction);
+        return transactionMapper.toResponse(transaction);
     }
 
     /**
@@ -91,35 +130,28 @@ public class PaymentService {
     public Page<PaymentResponse> getTransactionsByMerchant(String merchantId, Pageable pageable) {
         return transactionRepository
                 .findByMerchantIdOrderByCreatedAtDesc(merchantId, pageable)
-                .map(this::toResponse);
+                .map(transactionMapper::toResponse);
     }
 
     /**
      * 返金処理
      */
+    @Transactional(isolation = Isolation.READ_COMMITTED, rollbackFor = Exception.class)
     public PaymentResponse refundTransaction(String transactionId, BigDecimal refundAmount) {
         Transaction transaction = transactionRepository.findByTransactionId(transactionId)
                 .orElseThrow(() -> new TransactionNotFoundException(transactionId));
 
-        if (!transaction.getStatus().isRefundable()) {
-            throw new PaymentException("REFUND_NOT_ALLOWED", 
-                    "このトランザクションは返金できません。ステータス: " + transaction.getStatus());
-        }
-
-        if (refundAmount.compareTo(transaction.getAmount()) > 0) {
-            throw new PaymentException("INVALID_REFUND_AMOUNT", 
-                    "返金額が元の金額を超えています");
-        }
+        validateRefundRequest(transaction, refundAmount);
 
         log.info("返金処理開始: transactionId={}, refundAmount={}", transactionId, refundAmount);
 
-        // 返金処理（実際はここで外部決済プロセッサーを呼び出す）
+        // 返金処理（実際は外部APIを呼び出す）
         transaction.setStatus(TransactionStatus.REFUNDED);
         transaction.setProcessedAt(LocalDateTime.now());
         transaction = transactionRepository.save(transaction);
 
         log.info("返金処理完了: transactionId={}", transactionId);
-        return toResponse(transaction);
+        return transactionMapper.toResponse(transaction);
     }
 
     /**
@@ -128,7 +160,7 @@ public class PaymentService {
     @Transactional(readOnly = true)
     public Map<String, Object> getSalesSummary(String merchantId) {
         BigDecimal totalSales = transactionRepository.getTotalSalesByMerchant(merchantId);
-        List<Object[]> statusCounts = transactionRepository.countByStatus();
+        var statusCounts = transactionRepository.countByStatus();
 
         Map<String, Long> statusMap = statusCounts.stream()
                 .collect(Collectors.toMap(
@@ -146,28 +178,28 @@ public class PaymentService {
 
     // ========== Private Methods ==========
 
+    /**
+     * トランザクションEntity作成
+     */
     private Transaction createTransaction(PaymentRequest request) {
-        Transaction transaction = Transaction.builder()
-                .amount(request.getAmount())
-                .currency(request.getCurrency())
-                .paymentMethod(request.getPaymentMethod())
-                .merchantId(request.getMerchantId())
-                .customerId(request.getCustomerId())
-                .description(request.getDescription())
-                .metadata(request.getMetadata())
-                .status(TransactionStatus.PENDING)
-                .build();
-
+        Transaction transaction = transactionMapper.toEntity(request);
+        transaction.setStatus(TransactionStatus.PENDING);
         return transactionRepository.save(transaction);
     }
 
+    /**
+     * 決済処理実行
+     * 
+     * 実際のプロダクションでは、ここで外部決済ゲートウェイ
+     * （Stripe, PayPal, GMO等）のAPIを呼び出す
+     */
     private Transaction executePayment(Transaction transaction) {
         // ステータスを処理中に更新
         transaction.setStatus(TransactionStatus.PROCESSING);
         transaction = transactionRepository.save(transaction);
 
-        // 決済処理シミュレーション（実際は外部APIを呼び出す）
-        simulatePaymentProcessing();
+        // 外部API呼び出しシミュレーション
+        simulateExternalPaymentProcessor(transaction);
 
         // 完了ステータスに更新
         transaction.setStatus(TransactionStatus.COMPLETED);
@@ -175,37 +207,79 @@ public class PaymentService {
         return transactionRepository.save(transaction);
     }
 
-    private Transaction markAsFailed(Transaction transaction, String errorCode, String errorMessage) {
-        transaction.setStatus(TransactionStatus.FAILED);
-        transaction.setErrorCode(errorCode);
-        transaction.setErrorMessage(errorMessage);
-        transaction.setProcessedAt(LocalDateTime.now());
-        return transactionRepository.save(transaction);
-    }
-
-    private void simulatePaymentProcessing() {
-        // 実際の決済処理をシミュレート
+    /**
+     * 外部決済プロセッサーシミュレーション
+     * 
+     * 実際のテストケース用に、特定の条件でエラーを発生させる
+     */
+    private void simulateExternalPaymentProcessor(Transaction transaction) {
+        // 処理時間シミュレーション
         try {
-            Thread.sleep(100); // 100ms の処理時間
+            Thread.sleep(100 + random.nextInt(200));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+
+        // テスト用: 特定の顧客IDでエラーを発生
+        String customerId = transaction.getCustomerId();
+        
+        if (customerId != null) {
+            if (customerId.contains("INSUFFICIENT")) {
+                throw new InsufficientFundsException("残高が不足しています");
+            }
+            if (customerId.contains("INVALID_CARD")) {
+                throw new InvalidCardException("カード情報が無効です");
+            }
+            if (customerId.contains("TIMEOUT")) {
+                throw new PaymentTimeoutException("決済処理がタイムアウトしました");
+            }
+        }
+
+        // 確率的なエラー（1%）- 実際の障害をシミュレート
+        if (random.nextDouble() < 0.01) {
+            throw new PaymentException("PROCESSOR_ERROR", "決済プロセッサーでエラーが発生しました");
+        }
     }
 
-    private PaymentResponse toResponse(Transaction transaction) {
-        return PaymentResponse.builder()
-                .transactionId(transaction.getTransactionId())
-                .amount(transaction.getAmount())
-                .currency(transaction.getCurrency())
-                .status(transaction.getStatus())
-                .paymentMethod(transaction.getPaymentMethod())
-                .merchantId(transaction.getMerchantId())
-                .customerId(transaction.getCustomerId())
-                .description(transaction.getDescription())
-                .errorCode(transaction.getErrorCode())
-                .errorMessage(transaction.getErrorMessage())
-                .createdAt(transaction.getCreatedAt())
-                .processedAt(transaction.getProcessedAt())
-                .build();
+    /**
+     * トランザクション失敗処理
+     */
+    private void markTransactionFailed(Transaction transaction, Exception e) {
+        try {
+            transaction.setStatus(TransactionStatus.FAILED);
+            transaction.setProcessedAt(LocalDateTime.now());
+            
+            if (e instanceof PaymentException pe) {
+                transaction.setErrorCode(pe.getErrorCode());
+                transaction.setErrorMessage(pe.getMessage());
+            } else {
+                transaction.setErrorCode("UNKNOWN_ERROR");
+                transaction.setErrorMessage(e.getMessage());
+            }
+            
+            transactionRepository.save(transaction);
+        } catch (Exception ex) {
+            log.error("トランザクション失敗更新エラー: {}", ex.getMessage());
+        }
+    }
+
+    /**
+     * 返金リクエストバリデーション
+     */
+    private void validateRefundRequest(Transaction transaction, BigDecimal refundAmount) {
+        if (!transaction.getStatus().isRefundable()) {
+            throw new PaymentException("REFUND_NOT_ALLOWED", 
+                    "このトランザクションは返金できません。ステータス: " + transaction.getStatus());
+        }
+
+        if (refundAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new PaymentException("INVALID_REFUND_AMOUNT", 
+                    "返金額は0より大きい必要があります");
+        }
+
+        if (refundAmount.compareTo(transaction.getAmount()) > 0) {
+            throw new PaymentException("INVALID_REFUND_AMOUNT", 
+                    "返金額が元の金額を超えています");
+        }
     }
 }
