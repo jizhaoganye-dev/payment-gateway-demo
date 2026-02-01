@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { 
   TrendingUp, 
-  TrendingDown, 
   CreditCard, 
   CheckCircle2, 
   XCircle, 
